@@ -30,3 +30,4 @@ coverage.xml
 *.log
 *.pot
 *.mo
+reference_project/
