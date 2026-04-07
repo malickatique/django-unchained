@@ -131,6 +131,26 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ---------------------------------------------------------------------------
+# Django REST Framework
+# ---------------------------------------------------------------------------
+
+REST_FRAMEWORK = {
+    # ── Response envelope ────────────────────────────────────────────
+    # ApiRenderer wraps every response in {success, message, data, meta, errors}
+    "DEFAULT_RENDERER_CLASSES": [
+        "common.response.renderers.ApiRenderer",
+    ],
+
+    # ── Exception handling ───────────────────────────────────────────
+    # Central handler — normalises all exceptions into the error envelope
+    "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
+
+    # ── Pagination ───────────────────────────────────────────────────
+    "DEFAULT_PAGINATION_CLASS": "common.response.pagination.ApiPageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+
+# ---------------------------------------------------------------------------
 # Application metadata (used by logging, health checks, etc.)
 # ---------------------------------------------------------------------------
 

@@ -1041,125 +1041,419 @@ X_FRAME_OPTIONS = "DENY"
 
 ## 8. Exception Handling
 
-### DRF Custom Exception Handler
+This project uses a **three-tier exception handling architecture** — typed domain
+exceptions, a central DRF handler, and a renderer that enforces a consistent
+response envelope. All of this lives in `common/exceptions/` and `common/response/`.
 
-Register a central handler in settings to normalise all errors into a consistent
-envelope. Every exception — DRF, Django, or unhandled — flows through one place.
+### Package Structure
+
+```
+common/
+├── exceptions/
+│   ├── __init__.py     # Re-exports: exceptions, ErrorCode, handler
+│   ├── codes.py        # ErrorCode TextChoices + HTTP status → code mapping
+│   ├── base.py         # Exception hierarchy (8 classes)
+│   └── handler.py      # Central DRF exception handler
+└── response/
+    ├── __init__.py     # Re-exports: ApiResponse, ApiRenderer, ApiPageNumberPagination
+    ├── api_response.py # ApiResponse — DRF Response subclass with optional message
+    ├── pagination.py   # ApiPageNumberPagination (page/page_size, max 100)
+    └── renderers.py    # ApiRenderer — wraps ALL responses in standard envelope
+```
+
+---
+
+### Response Envelope Contract
+
+Every API response — success or error — uses the same shape:
+
+**Success (single object):**
+```json
+{
+  "success": true,
+  "message": "User created successfully.",
+  "data": { "id": "...", "email": "..." },
+  "meta": {},
+  "errors": null
+}
+```
+
+**Success (paginated list):**
+```json
+{
+  "success": true,
+  "message": null,
+  "data": [ ... ],
+  "meta": {
+    "pagination": {
+      "page": 1, "page_size": 20, "total_pages": 5,
+      "total_records": 97, "has_next": true, "has_previous": false,
+      "next": "/api/v1/users/?page=2", "previous": null
+    }
+  },
+  "errors": null
+}
+```
+
+**Error:**
+```json
+{
+  "success": false,
+  "message": "Validation failed.",
+  "data": null,
+  "meta": {},
+  "errors": {
+    "code": "VALIDATION_ERROR",
+    "details": [
+      { "type": "field", "field": "email", "code": "REQUIRED", "message": "This field is required." },
+      { "type": "field", "field": "profile.phone", "code": "INVALID", "message": "Enter a valid phone number." }
+    ]
+  }
+}
+```
+
+`success` and the HTTP status code always agree — `true` = 2xx, `false` = 4xx/5xx.
+The `code` field in errors is machine-readable; `message` is human-readable.
+
+---
+
+### How It Works — Exception Flow
+
+```
+Request hits a view
+        │
+        ▼
+View / Serializer / Service raises an exception
+        │
+        ▼
+┌────────────────────────────────────────────────────┐
+│  api_exception_handler()  (handler.py)             │
+│                                                    │
+│  Priority order:                                   │
+│  1. BaseAPIException subclass  →  _handle_domain_exception()   │
+│  2. DRF ValidationError        →  _handle_drf_validation_error() │
+│  3. Django ValidationError     →  _handle_django_validation_error() │
+│  4. DRF APIException           →  _handle_drf_api_exception()  │
+│  5. Django Http404             →  404 NOT_FOUND response        │
+│  6. Django PermissionDenied    →  403 PERMISSION_DENIED response│
+│  7. Anything else              →  _handle_unhandled_exception() │
+│                                                    │
+│  All paths call _build_error_response()            │
+│  and log appropriately (warning/error/security)    │
+└────────────────────┬───────────────────────────────┘
+                     │
+                     ▼
+              Response(body, status=...)
+                     │
+                     ▼
+┌────────────────────────────────────────────────────┐
+│  ApiRenderer.render()  (renderers.py)              │
+│                                                    │
+│  Already enveloped (success+errors keys)?  → pass through │
+│  204 No Content?                           → empty body   │
+│  Has results+count (pagination)?           → wrap with meta.pagination │
+│  Normal success data?                      → wrap in success envelope  │
+└────────────────────────────────────────────────────┘
+                     │
+                     ▼
+              JSON response sent to client
+```
+
+---
+
+### Exception Hierarchy
+
+```
+Exception
+└── BaseAPIException          (base.py)
+    ├── ValidationException   400 VALIDATION_ERROR
+    ├── BusinessException     400 BUSINESS_RULE_VIOLATION
+    ├── AuthenticationException  401 AUTHENTICATION_ERROR
+    ├── PermissionException   403 PERMISSION_DENIED
+    ├── NotFoundException     404 NOT_FOUND
+    ├── ConflictException     409 CONFLICT
+    └── ServiceUnavailableException  503 SERVICE_UNAVAILABLE
+```
+
+Every class has a `default_status_code` and `default_error_code`. Services can
+override both per-instance:
+
+```python
+raise BusinessException(
+    message="Only draft orders can be submitted.",
+    error_code=ErrorCode.INVALID_STATE_TRANSITION,   # override the default
+)
+```
+
+---
+
+### Error Codes
+
+`ErrorCode` is a `TextChoices` enum in `codes.py`. Use constants — never strings.
+
+```python
+from common.exceptions import ErrorCode
+
+# Validation & Input
+ErrorCode.VALIDATION_ERROR          # "VALIDATION_ERROR"
+ErrorCode.BAD_REQUEST               # "BAD_REQUEST"
+
+# Authentication & Access
+ErrorCode.AUTHENTICATION_ERROR      # "AUTHENTICATION_ERROR"
+ErrorCode.PERMISSION_DENIED         # "PERMISSION_DENIED"
+ErrorCode.TOKEN_EXPIRED             # "TOKEN_EXPIRED"
+
+# Resource State
+ErrorCode.NOT_FOUND                 # "NOT_FOUND"
+ErrorCode.CONFLICT                  # "CONFLICT"
+ErrorCode.GONE                      # "GONE"
+
+# Domain / Business Logic
+ErrorCode.INVALID_STATE_TRANSITION  # "INVALID_STATE_TRANSITION"
+ErrorCode.BUSINESS_RULE_VIOLATION   # "BUSINESS_RULE_VIOLATION"
+
+# Rate Limiting
+ErrorCode.RATE_LIMITED              # "RATE_LIMITED"
+
+# System / Infrastructure
+ErrorCode.SYSTEM_ERROR              # "SYSTEM_ERROR"
+ErrorCode.SERVICE_UNAVAILABLE       # "SERVICE_UNAVAILABLE"
+```
+
+**Adding app-specific codes:** Put them in `apps/<app>/exceptions/codes.py` using
+the same `TextChoices` pattern. Only add a new code when the **frontend needs to
+branch behaviour** based on it (e.g., show a retry button). If a message toast is
+enough, use a generic code with a descriptive `message`.
+
+---
+
+### Settings
 
 ```python
 # config/settings/base.py
 REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": [
+        "common.response.renderers.ApiRenderer",
+    ],
     "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
+    "DEFAULT_PAGINATION_CLASS": "common.response.pagination.ApiPageNumberPagination",
+    "PAGE_SIZE": 20,
 }
 ```
 
-```python
-# common/exceptions/handler.py
-import logging
-from rest_framework.views import exception_handler
-from rest_framework.response import Response
-from rest_framework import status
-from django.core.exceptions import ValidationError as DjangoValidationError
+---
 
-logger = logging.getLogger("common.exceptions.handler")
+### Usage in Services
 
-
-def api_exception_handler(exc, context):
-    """Normalise all API errors into a consistent JSON envelope."""
-
-    # Convert Django ValidationError → DRF ValidationError
-    if isinstance(exc, DjangoValidationError):
-        from rest_framework.exceptions import ValidationError
-        exc = ValidationError(
-            detail=exc.message_dict if hasattr(exc, "message_dict") else exc.messages
-        )
-
-    response = exception_handler(exc, context)
-
-    if response is not None:
-        response.data = {
-            "success": False,
-            "message": _extract_message(response.data),
-            "errors": response.data,
-        }
-    else:
-        # Unhandled exception — log with full traceback, return generic 500
-        logger.exception("Unhandled exception", exc_info=exc)
-        response = Response(
-            {"success": False, "message": "An unexpected error occurred.", "errors": {}},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
-
-    return response
-
-
-def _extract_message(data):
-    if isinstance(data, dict):
-        detail = data.get("detail")
-        if detail:
-            return str(detail)
-    return "Request failed."
-```
-
-### Raising Errors in Services
-
-Never construct error response dicts manually. Raise Python exceptions in services
-and let the central handler normalise them:
+**Never** raise DRF exceptions in service functions. Raise domain exceptions —
+they're framework-agnostic and testable without a request context.
 
 ```python
-from rest_framework.exceptions import ValidationError, PermissionDenied, NotFound
+from common.exceptions import (
+    NotFoundException, BusinessException, ConflictException, ErrorCode
+)
 
-def get_user(user_id: str, requesting_user) -> User:
+def get_user(user_id: str) -> User:
     try:
-        user = User.objects.get(id=user_id)
+        return User.objects.get(id=user_id)
     except User.DoesNotExist:
-        raise NotFound("User not found.")
+        raise NotFoundException("User not found.")
 
-    if user != requesting_user:
-        raise PermissionDenied("You cannot access another user's data.")
-
-    return user
-```
-
-### Custom Domain Exceptions
-
-For business-rule violations, define typed exceptions that carry an error code:
-
-```python
-# common/exceptions/base.py
-from rest_framework.exceptions import APIException
-from rest_framework import status
-
-
-class BusinessException(APIException):
-    status_code = status.HTTP_400_BAD_REQUEST
-    default_code = "business_rule_violation"
-
-    def __init__(self, message: str, error_code: str = None):
-        self.detail = message
-        self.error_code = error_code
-        super().__init__(detail=message)
-
-
-class NotFoundException(APIException):
-    status_code = status.HTTP_404_NOT_FOUND
-    default_code = "not_found"
-```
-
-Usage in services:
-
-```python
-from common.exceptions.base import BusinessException
 
 def submit_order(order_id: str, user) -> Order:
-    order = get_object_or_404(Order, id=order_id, user=user)
+    order = Order.objects.filter(id=order_id, user=user).first()
+    if not order:
+        raise NotFoundException("Order not found.")
     if order.status != "DRAFT":
         raise BusinessException(
-            "Only draft orders can be submitted.",
-            error_code="INVALID_STATE_TRANSITION",
+            message="Only draft orders can be submitted.",
+            error_code=ErrorCode.INVALID_STATE_TRANSITION,
         )
-    ...
+    order.status = "SUBMITTED"
+    order.save()
+    return order
+
+
+def create_user(email: str, **kwargs) -> User:
+    if User.objects.filter(email=email).exists():
+        raise ConflictException("A user with this email already exists.")
+    return User.objects.create(email=email, **kwargs)
 ```
+
+---
+
+### Usage in Views
+
+Views return plain `Response(data)` — the renderer wraps everything automatically.
+Use `ApiResponse` only when you need a success `message` for a toast notification:
+
+```python
+from rest_framework import status, viewsets
+from rest_framework.response import Response
+from common.response import ApiResponse
+
+
+class UserViewSet(viewsets.ViewSet):
+
+    def list(self, request):
+        users = list_users()
+        serializer = UserSerializer(users, many=True)
+        return Response(serializer.data)                   # message=null, wrapped automatically
+
+    def create(self, request):
+        user = create_user(**request.data)
+        serializer = UserSerializer(user)
+        return ApiResponse(                                 # attach a toast message
+            serializer.data,
+            status=status.HTTP_201_CREATED,
+            message="User created successfully.",
+        )
+
+    def destroy(self, request, pk=None):
+        delete_user(pk)
+        return Response(status=status.HTTP_204_NO_CONTENT) # empty body, no envelope
+```
+
+---
+
+### Validation Errors — Nested Serializers
+
+`handler.py` flattens nested DRF validation errors into a flat `details[]` list
+using dot-notation. The frontend always gets the same shape regardless of how
+deeply nested the serializer is:
+
+```python
+# Serializer with nested profile
+class UserSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    profile = ProfileSerializer()
+
+# If email + profile.phone both fail:
+{
+  "errors": {
+    "code": "VALIDATION_ERROR",
+    "details": [
+      {"type": "field", "field": "email",         "code": "REQUIRED", "message": "..."},
+      {"type": "field", "field": "profile.phone", "code": "INVALID",  "message": "..."}
+    ]
+  }
+}
+```
+
+---
+
+### App-Specific Error Codes
+
+Add domain codes only when the frontend needs to take a different action:
+
+```python
+# apps/orders/exceptions/codes.py
+from django.db import models
+
+class OrderErrorCode(models.TextChoices):
+    ORDER_ALREADY_SUBMITTED = "ORDER_ALREADY_SUBMITTED", "Order already submitted"
+    PAYMENT_METHOD_REQUIRED = "PAYMENT_METHOD_REQUIRED", "Payment method required"
+```
+
+```python
+# apps/orders/services/order_service.py
+from common.exceptions import BusinessException
+from apps.orders.exceptions.codes import OrderErrorCode
+
+def submit_order(order_id: str, user) -> Order:
+    ...
+    raise BusinessException(
+        message="This order has already been submitted.",
+        error_code=OrderErrorCode.ORDER_ALREADY_SUBMITTED,
+    )
+```
+
+---
+
+### Best Practices
+
+**1. Always raise typed domain exceptions from services — never DRF exceptions**
+
+```python
+# Good — domain exception, no DRF import needed in services
+raise NotFoundException("Order not found.")
+
+# Bad — DRF exception couples services to the HTTP layer
+from rest_framework.exceptions import NotFound
+raise NotFound("Order not found.")
+```
+
+**2. Never return error dicts from services**
+
+```python
+# Good
+raise BusinessException("Insufficient stock.")
+
+# Bad — callers must check return value; errors silently get ignored
+return {"error": "Insufficient stock."}
+```
+
+**3. Use the right exception class**
+
+| Situation | Exception |
+|-----------|-----------|
+| Resource not found | `NotFoundException` |
+| Duplicate / already exists | `ConflictException` |
+| FSM violation (wrong state) | `BusinessException(error_code=INVALID_STATE_TRANSITION)` |
+| Domain rule violated | `BusinessException` |
+| Bad input (field-level) | Let serializer raise `DRFValidationError` |
+| Invalid credentials | `AuthenticationException` |
+| Lacks permission | `PermissionException` |
+| External service down | `ServiceUnavailableException` |
+
+**4. Keep error messages human-readable, error codes machine-readable**
+
+```python
+# Good — message for humans, code for frontend logic
+raise BusinessException(
+    message="Your account has been suspended. Contact support.",
+    error_code=ErrorCode.PERMISSION_DENIED,
+)
+
+# Bad — technical jargon in message
+raise BusinessException(message="PERMISSION_DENIED_ACCOUNT_SUSPENDED")
+```
+
+**5. Use `details` for field-level context on domain exceptions**
+
+```python
+raise ValidationException(
+    message="Profile validation failed.",
+    details=[
+        {"type": "field", "field": "phone", "code": "INVALID_FORMAT",
+         "message": "Phone must be in E.164 format."},
+    ],
+)
+```
+
+**6. The 500 response in production hides internals — trust it**
+
+`_handle_unhandled_exception()` logs the full traceback server-side but returns
+a generic `"Something went wrong"` to clients in production. Never catch-all and
+re-raise just to include exception details in the response — it leaks internals.
+
+**7. `ServiceUnavailableException` for retryable failures**
+
+```python
+try:
+    result = external_payment_api.charge(...)
+except requests.Timeout:
+    raise ServiceUnavailableException(
+        "Payment service is temporarily unavailable. Please try again."
+    )
+```
+
+**8. Don't add app-specific error codes for every failure — keep the set tight**
+
+A generic `BUSINESS_RULE_VIOLATION` with a descriptive `message` is almost always
+enough. Only add a dedicated code when the frontend must branch its UI (e.g.,
+show a "Resubmit documents" button vs a generic retry). Every new code becomes
+a contract with consumers — be conservative.
 
 ---
 
