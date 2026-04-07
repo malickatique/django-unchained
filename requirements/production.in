@@ -1,0 +1,36 @@
+# =============================================================================
+# Production — deployment & operations (inherits base)
+# =============================================================================
+# Compile: pip-compile requirements/production.in -o requirements/production.txt
+# Install: pip-sync requirements/production.txt
+# =============================================================================
+-r base.in
+
+# ---------------------------------------------------------------------------
+# WSGI / ASGI server
+# ---------------------------------------------------------------------------
+gunicorn>=23.0,<24.0                    # Synchronous WSGI server (primary)
+uvicorn[standard]>=0.32,<1.0           # ASGI server (for async views / WebSocket)
+
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+django-redis>=5.4,<6.0                  # Redis cache backend for Django
+
+# ---------------------------------------------------------------------------
+# Static files
+# ---------------------------------------------------------------------------
+whitenoise>=6.8,<7.0                    # Serve static files from Django (no nginx required)
+
+# ---------------------------------------------------------------------------
+# Monitoring & observability
+# ---------------------------------------------------------------------------
+sentry-sdk[django,celery]>=2.14,<3.0   # Error tracking + performance monitoring
+django-health-check>=3.18,<4.0         # /health/ endpoint for load-balancer probes
+django-prometheus>=2.3,<3.0            # Prometheus /metrics exporter
+
+# ---------------------------------------------------------------------------
+# Security hardening
+# ---------------------------------------------------------------------------
+django-csp>=3.8,<4.0                    # Content-Security-Policy response headers
+django-permissions-policy>=4.21,<5.0   # Permissions-Policy response headers

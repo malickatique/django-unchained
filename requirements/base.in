@@ -1,0 +1,51 @@
+# =============================================================================
+# Base — required in ALL environments (development, test, production)
+# =============================================================================
+# Compile: pip-compile requirements/base.in -o requirements/base.txt
+# Install: pip-sync requirements/development.txt  (never install base.txt directly)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Framework
+# ---------------------------------------------------------------------------
+Django>=6.0,<6.1                        # LTS target — settings reference 6.0 docs
+djangorestframework>=3.15,<4.0          # REST API layer
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+psycopg[binary]>=3.2,<4.0              # PostgreSQL adapter — psycopg 3 (Django 6.0 native)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+django-environ>=0.11,<1.0              # env-based settings (.env → settings)
+
+# ---------------------------------------------------------------------------
+# API — filtering, rate-limiting, schema
+# ---------------------------------------------------------------------------
+django-filter>=25.0,<26.0              # DRF filter backends (DjangoFilterBackend)
+django-ratelimit>=4.1,<5.0             # Per-view / per-user rate limiting
+drf-spectacular>=0.28,<1.0             # OpenAPI 3.1 schema + Swagger UI
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+django-cors-headers>=4.4,<5.0          # Cross-origin headers for SPA / mobile clients
+
+# ---------------------------------------------------------------------------
+# Async tasks
+# ---------------------------------------------------------------------------
+celery>=5.4,<6.0                        # Distributed task queue
+redis>=5.0,<6.0                         # Celery broker + Django cache backend
+
+# ---------------------------------------------------------------------------
+# Security & Auth
+# ---------------------------------------------------------------------------
+PyJWT>=2.9,<3.0                         # JWT token encoding / decoding
+argon2-cffi>=23.1,<24.0                 # Argon2 password hasher (OWASP recommended over bcrypt)
+
+# ---------------------------------------------------------------------------
+# Seed / reference data helpers
+# ---------------------------------------------------------------------------
+pycountry>=24.6,<25.0                   # ISO country, currency, language codes for fixtures

@@ -8,21 +8,23 @@
 
 ## Table of Contents
 
-1. [Python & Environment Setup (macOS M-series)](#1-python--environment-setup-macos-m-series)
-2. [Django Installation & Project Scaffold](#2-django-installation--project-scaffold)
-3. [Project Structure — Modular Layout](#3-project-structure--modular-layout)
-4. [Settings, Config & Environment Variables](#4-settings-config--environment-variables)
-5. [Database — PostgreSQL, Models, Migrations, Seeds](#5-database--postgresql-models-migrations-seeds)
-6. [ORM — Relations & Operations](#6-orm--relations--operations)
-7. [Django REST Framework — APIs Done Right](#7-django-rest-framework--apis-done-right)
-8. [Exception Handling](#8-exception-handling)
-9. [Structured Logging](#9-structured-logging)
-10. [Caching](#10-caching)
-11. [Async & Queues — Celery + Kafka](#11-async--queues--celery--kafka)
-12. [Testing](#12-testing)
-13. [Security Checklist](#13-security-checklist)
-14. [Deployment Notes](#14-deployment-notes)
-15. [Quick Reference — Commands Cheatsheet](#15-quick-reference--commands-cheatsheet)
+1.  [Python & Environment Setup (macOS M-series)](#1-python--environment-setup-macos-m-series)
+2.  [Django Installation & Project Scaffold](#2-django-installation--project-scaffold)
+3.  [Dependency Management — pip-tools & Requirements](#3-dependency-management--pip-tools--requirements)
+4.  [Project Structure — Modular Layout](#4-project-structure--modular-layout)
+5.  [Settings, Config & Environment Variables](#5-settings-config--environment-variables)
+6.  [Database — PostgreSQL, Models, Migrations, Seeds](#6-database--postgresql-models-migrations-seeds)
+7.  [ORM — Relations & Operations](#7-orm--relations--operations)
+8.  [Django REST Framework — APIs Done Right](#8-django-rest-framework--apis-done-right)
+9.  [Exception Handling](#9-exception-handling)
+10. [Consistent Response Contract](#10-consistent-response-contract)
+11. [Structured Logging](#11-structured-logging)
+12. [Caching](#12-caching)
+13. [Async & Queues — Celery + Kafka](#13-async--queues--celery--kafka)
+14. [Testing](#14-testing)
+15. [Security Checklist](#15-security-checklist)
+16. [Deployment Notes](#16-deployment-notes)
+17. [Quick Reference — Commands Cheatsheet](#17-quick-reference--commands-cheatsheet)
 
 ---
 
@@ -184,7 +186,302 @@ python manage.py <command>
 
 ---
 
-## 3. Project Structure — Modular Layout
+## 3. Dependency Management — pip-tools & Requirements
+
+This project uses **pip-tools** to separate what you _choose_ to depend on (`.in` files)
+from the fully-resolved, pinned lock files (`.txt` files). The pattern is identical to
+`package.json` + `package-lock.json` in Node, or `composer.json` + `composer.lock` in Laravel.
+
+### Why pip-tools?
+
+| Problem | pip-tools solution |
+|---------|-------------------|
+| `pip freeze` dumps every transitive dependency — hard to audit | `.in` files contain **only your direct dependencies** |
+| Different developers resolve to different versions | `.txt` lock files **pin every transitive dep** to an exact version |
+| "When did we add celery?" is unclear from a 200-line freeze | Each `.in` line has an inline comment explaining **why it's there** |
+| Security team needs to audit dependencies | Show them the 15-line `.in` file, not the 200-line lock file |
+
+---
+
+### File Layout
+
+```
+requirements/
+├── base.in           # Your direct dependencies — required in ALL environments
+├── base.txt          # pip-compile output — every transitive dep, pinned (commit this)
+│
+├── development.in    # Dev extras: debug toolbar, ipython, ruff, mypy
+├── development.txt   # Generated lock file for local development
+│
+├── test.in           # Test extras: pytest, factory-boy, faker, freezegun
+├── test.txt          # Generated lock file for CI / test runs
+│
+└── production.in     # Prod extras: gunicorn, sentry, whitenoise, health checks
+    production.txt    # Generated lock file for deployment
+```
+
+**Rule:** Each `.in` file for a non-base environment starts with `-r base.in` to inherit core
+dependencies. You write `.in` files. `pip-compile` generates `.txt` files.
+
+---
+
+### What Each File Contains
+
+**`base.in`** — Framework and infrastructure required everywhere:
+
+```
+Django, djangorestframework, psycopg[binary]       # Core
+django-environ, django-filter, django-ratelimit    # Config + API
+drf-spectacular, django-cors-headers               # Schema + CORS
+celery, redis                                      # Async tasks + cache
+PyJWT, argon2-cffi                                 # Auth + security
+pycountry                                          # Seed / fixture data
+```
+
+**`development.in`** — Local DX tools:
+
+```
+-r base.in
+django-debug-toolbar, ipython   # SQL inspection + rich shell
+ruff, pre-commit                # Linter / formatter + git hooks
+watchfiles                      # Fast hot-reload
+django-stubs, mypy              # Type checking
+```
+
+**`test.in`** — CI and local test runner:
+
+```
+-r base.in
+pytest, pytest-django           # Test framework
+pytest-cov, pytest-xdist        # Coverage + parallel runs
+factory-boy, faker              # Model factories + fake data
+httpx, pytest-asyncio           # API integration + async tests
+freezegun                       # Time-freezing for token/expiry tests
+ruff                            # Linter in CI (same version as dev)
+```
+
+**`production.in`** — Deployment and operations:
+
+```
+-r base.in
+gunicorn, uvicorn               # WSGI / ASGI servers
+django-redis, whitenoise        # Cache backend + static files
+sentry-sdk                      # Error tracking + performance
+django-health-check             # /health/ for load-balancer probes
+django-prometheus               # /metrics for Prometheus scraping
+django-csp, django-permissions-policy  # Security headers
+```
+
+---
+
+### First-time Setup — Clone & Install
+
+```bash
+# 1. Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate      # macOS / Linux
+.venv\Scripts\activate         # Windows
+
+# 2. Install pip-tools (one time only per environment)
+pip install pip-tools
+
+# 3. Sync your dev environment — installs exactly what's in development.txt
+make deps-sync
+# or: pip-sync requirements/development.txt
+```
+
+> `pip-sync` is stricter than `pip install -r` — it **also removes** packages that are NOT
+> in the lock file, giving you a clean, reproducible environment.
+
+---
+
+### Daily Workflow
+
+#### Adding a package
+
+```bash
+# 1. Add the package to the right .in file with an inline comment:
+#    requirements/base.in
+#    Stripe payment processing
+#    stripe>=8.0,<9.0
+
+# 2. Recompile (base must be compiled first; downstream files inherit it)
+make deps-compile
+# or individually: pip-compile requirements/base.in -o requirements/base.txt
+
+# 3. Sync your local environment
+make deps-sync
+```
+
+#### Upgrading a specific package
+
+```bash
+# Upgrade only Django across all environments
+make deps-upgrade-package PKG=django
+
+# Under the hood this runs:
+pip-compile --upgrade-package django requirements/base.in -o requirements/base.txt
+# ... plus development, test, production
+```
+
+#### Upgrading all packages at once
+
+```bash
+# Upgrades every package to the latest version allowed by .in constraints
+make deps-upgrade
+```
+
+#### Removing a package
+
+```bash
+# 1. Delete the line from the .in file
+# 2. Recompile — pip-compile drops it and any orphaned transitive deps
+make deps-compile
+# 3. Sync — pip-sync uninstalls the removed packages
+make deps-sync
+```
+
+---
+
+### Installing in Each Environment
+
+```bash
+# Local development (you)
+make deps-sync                             # installs from development.txt
+
+# CI / GitHub Actions
+pip install pip-tools
+pip-sync requirements/test.txt
+
+# Production / Docker
+pip install pip-tools
+pip-sync requirements/production.txt
+```
+
+**Dockerfile pattern:**
+
+```dockerfile
+FROM python:3.14-slim
+WORKDIR /app
+
+# Install deps first — Docker layer cache means this only re-runs on lock file changes
+COPY requirements/production.txt requirements/production.txt
+RUN pip install --no-cache-dir pip-tools \
+ && pip-sync requirements/production.txt
+
+COPY . .
+```
+
+---
+
+### Makefile Reference
+
+All dependency commands are available via `make`. Run `make help` to see all targets.
+
+| Command | What it does |
+|---------|-------------|
+| `make deps-compile` | Compile all 4 `.in` → `.txt` lock files |
+| `make deps-compile-base` | Compile only base.in → base.txt |
+| `make deps-compile-dev` | Compile only development.in → development.txt |
+| `make deps-compile-test` | Compile only test.in → test.txt |
+| `make deps-compile-prod` | Compile only production.in → production.txt |
+| `make deps-sync` | Sync local dev env from development.txt |
+| `make deps-sync-test` | Sync from test.txt (CI use) |
+| `make deps-sync-prod` | Sync from production.txt |
+| `make deps-upgrade` | Upgrade all packages + recompile + sync |
+| `make deps-upgrade-package PKG=x` | Upgrade one package across all envs |
+
+---
+
+### What to Commit to Git
+
+```
+✅  Always commit (your intent + reproducible lock files):
+    requirements/base.in
+    requirements/base.txt
+    requirements/development.in
+    requirements/development.txt
+    requirements/test.in
+    requirements/test.txt
+    requirements/production.in
+    requirements/production.txt
+    Makefile
+
+❌  Never commit:
+    .venv/
+    venv/
+    __pycache__/
+    *.pyc
+```
+
+Committing the `.txt` files is the same principle as committing `package-lock.json` —
+every developer and CI job uses **exactly the same resolved versions**.
+
+---
+
+### Version Constraint Convention
+
+Follow the pattern used across all `.in` files:
+
+```
+package>=CURRENT,<NEXT_MAJOR    # tight, predictable, upgrade-friendly
+```
+
+| Pattern | When to use |
+|---------|-------------|
+| `>=5.4,<6.0` | Normal packages — accept all patches and minors, block major upgrades |
+| `>=6.0,<6.1` | Framework core (Django) — extra caution, pin minor too |
+| `>=2.14,<3.0` | Third-party SDKs with breaking APIs (Sentry, etc.) |
+| `>=0.8,<1.0` | Pre-1.0 packages — any minor could break |
+
+---
+
+### Best Practices
+
+**1. One direct dependency per line, with an inline comment**
+
+```
+# Good — auditable, reviewable by security teams
+stripe>=8.0,<9.0                # Stripe payment processing (apps/payments/)
+
+# Bad — no context, no-one knows why it's there
+stripe
+```
+
+**2. Add to the right layer**
+
+```
+base.in       ← needs to run in production and tests
+development.in ← only needed when coding locally
+test.in       ← only needed in CI / running tests
+production.in ← only needed when deployed (servers, monitoring)
+```
+
+**3. Never install directly from production.in — always use pip-sync from a .txt file**
+
+```bash
+# Good — reproducible, everyone uses identical versions
+pip-sync requirements/development.txt
+
+# Bad — pip resolves freely, different machines may get different versions
+pip install -r requirements/development.in
+```
+
+**4. After any .in change, recompile AND sync**
+
+Editing a `.in` file and forgetting to compile is the most common mistake. The `.txt`
+files will be stale — your team will install different versions. Run `make deps-compile`
+and commit the updated `.txt` immediately.
+
+**5. Use `--upgrade-package` for deliberate single-package upgrades**
+
+Running `make deps-upgrade` all at once is risky in production codebases. Prefer
+upgrading one package at a time (`make deps-upgrade-package PKG=django`), reviewing
+the diff, and running the test suite before committing.
+
+---
+
+## 4. Project Structure — Modular Layout
 
 The default flat layout doesn't scale. Use this structure:
 
@@ -293,7 +590,7 @@ urlpatterns = [
 
 ---
 
-## 4. Settings, Config & Environment Variables
+## 5. Settings, Config & Environment Variables
 
 ### Install django-environ
 
@@ -395,7 +692,7 @@ DJANGO_ENV=production python manage.py runserver
 
 ---
 
-## 5. Database — PostgreSQL, Models, Migrations, Seeds
+## 6. Database — PostgreSQL, Models, Migrations, Seeds
 
 ### Install PostgreSQL
 
@@ -611,7 +908,7 @@ python manage.py loaddata fixtures/users.json
 
 ---
 
-## 6. ORM — Relations & Operations
+## 7. ORM — Relations & Operations
 
 ### Relationship Types
 
@@ -744,7 +1041,7 @@ Category.objects.annotate(
 
 ---
 
-## 7. Django REST Framework — APIs Done Right
+## 8. Django REST Framework — APIs Done Right
 
 ### Install everything
 
@@ -789,14 +1086,10 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
-    "DEFAULT_PAGINATION_CLASS": "common.pagination.StandardPagination",
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
-    ],
-    "DEFAULT_RENDERER_CLASSES": [
-        "rest_framework.renderers.JSONRenderer",
     ],
     "DEFAULT_THROTTLE_CLASSES": [
         "rest_framework.throttling.AnonRateThrottle",
@@ -806,7 +1099,16 @@ REST_FRAMEWORK = {
         "anon": "100/hour",
         "user": "1000/hour",
     },
-    "EXCEPTION_HANDLER": "common.exceptions.custom_exception_handler",
+    # ── Response contract (see Section 9) ──────────────────────────
+    # ApiRenderer wraps every response in the standard envelope automatically
+    "DEFAULT_RENDERER_CLASSES": [
+        "common.response.renderers.ApiRenderer",
+    ],
+    # Central handler normalises all exceptions into the error envelope
+    "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
+    # Page-number pagination: ?page=1&page_size=20 (max 100)
+    "DEFAULT_PAGINATION_CLASS": "common.response.pagination.ApiPageNumberPagination",
+    "PAGE_SIZE": 20,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",  # if using drf-spectacular
 }
 ```
@@ -1039,124 +1341,49 @@ X_FRAME_OPTIONS = "DENY"
 
 ---
 
-## 8. Exception Handling
+## 9. Exception Handling
 
-This project uses a **three-tier exception handling architecture** — typed domain
-exceptions, a central DRF handler, and a renderer that enforces a consistent
-response envelope. All of this lives in `common/exceptions/` and `common/response/`.
+All exception handling lives in `common/exceptions/`. A central DRF handler
+intercepts every exception — whether it is a typed domain exception, a DRF
+serializer error, or a completely unexpected crash — normalises it into a
+machine-readable error code and human-readable message, and hands off a `Response`
+object. The renderer (see **Section 9**) then enforces the final envelope shape.
 
 ### Package Structure
 
 ```
-common/
-├── exceptions/
-│   ├── __init__.py     # Re-exports: exceptions, ErrorCode, handler
-│   ├── codes.py        # ErrorCode TextChoices + HTTP status → code mapping
-│   ├── base.py         # Exception hierarchy (8 classes)
-│   └── handler.py      # Central DRF exception handler
-└── response/
-    ├── __init__.py     # Re-exports: ApiResponse, ApiRenderer, ApiPageNumberPagination
-    ├── api_response.py # ApiResponse — DRF Response subclass with optional message
-    ├── pagination.py   # ApiPageNumberPagination (page/page_size, max 100)
-    └── renderers.py    # ApiRenderer — wraps ALL responses in standard envelope
+common/exceptions/
+├── __init__.py   # Re-exports: all exception classes, ErrorCode, api_exception_handler
+├── codes.py      # ErrorCode TextChoices (13 codes) + HTTP status → code mapping
+├── base.py       # Exception hierarchy: BaseAPIException + 7 typed subclasses
+└── handler.py    # Central DRF exception handler — 7-priority dispatch chain
 ```
 
 ---
 
-### Response Envelope Contract
-
-Every API response — success or error — uses the same shape:
-
-**Success (single object):**
-```json
-{
-  "success": true,
-  "message": "User created successfully.",
-  "data": { "id": "...", "email": "..." },
-  "meta": {},
-  "errors": null
-}
-```
-
-**Success (paginated list):**
-```json
-{
-  "success": true,
-  "message": null,
-  "data": [ ... ],
-  "meta": {
-    "pagination": {
-      "page": 1, "page_size": 20, "total_pages": 5,
-      "total_records": 97, "has_next": true, "has_previous": false,
-      "next": "/api/v1/users/?page=2", "previous": null
-    }
-  },
-  "errors": null
-}
-```
-
-**Error:**
-```json
-{
-  "success": false,
-  "message": "Validation failed.",
-  "data": null,
-  "meta": {},
-  "errors": {
-    "code": "VALIDATION_ERROR",
-    "details": [
-      { "type": "field", "field": "email", "code": "REQUIRED", "message": "This field is required." },
-      { "type": "field", "field": "profile.phone", "code": "INVALID", "message": "Enter a valid phone number." }
-    ]
-  }
-}
-```
-
-`success` and the HTTP status code always agree — `true` = 2xx, `false` = 4xx/5xx.
-The `code` field in errors is machine-readable; `message` is human-readable.
-
----
-
-### How It Works — Exception Flow
+### Exception Dispatch Flow
 
 ```
-Request hits a view
-        │
-        ▼
 View / Serializer / Service raises an exception
-        │
-        ▼
-┌────────────────────────────────────────────────────┐
-│  api_exception_handler()  (handler.py)             │
-│                                                    │
-│  Priority order:                                   │
-│  1. BaseAPIException subclass  →  _handle_domain_exception()   │
-│  2. DRF ValidationError        →  _handle_drf_validation_error() │
-│  3. Django ValidationError     →  _handle_django_validation_error() │
-│  4. DRF APIException           →  _handle_drf_api_exception()  │
-│  5. Django Http404             →  404 NOT_FOUND response        │
-│  6. Django PermissionDenied    →  403 PERMISSION_DENIED response│
-│  7. Anything else              →  _handle_unhandled_exception() │
-│                                                    │
-│  All paths call _build_error_response()            │
-│  and log appropriately (warning/error/security)    │
-└────────────────────┬───────────────────────────────┘
-                     │
-                     ▼
-              Response(body, status=...)
-                     │
-                     ▼
-┌────────────────────────────────────────────────────┐
-│  ApiRenderer.render()  (renderers.py)              │
-│                                                    │
-│  Already enveloped (success+errors keys)?  → pass through │
-│  204 No Content?                           → empty body   │
-│  Has results+count (pagination)?           → wrap with meta.pagination │
-│  Normal success data?                      → wrap in success envelope  │
-└────────────────────────────────────────────────────┘
-                     │
-                     ▼
-              JSON response sent to client
+                    │
+                    ▼
+    ┌───────────────────────────────────────┐
+    │   api_exception_handler()             │
+    │                                       │
+    │   1. BaseAPIException subclass        │  ← domain exceptions (highest priority)
+    │   2. DRF ValidationError             │  ← serializer field errors
+    │   3. Django ValidationError          │  ← model.clean() errors
+    │   4. DRF APIException                │  ← auth, throttle, etc.
+    │   5. Django Http404                  │  ← get_object_or_404
+    │   6. Django PermissionDenied         │  ← decorator-level
+    │   7. Anything else                   │  ← unhandled → SYSTEM_ERROR + full log
+    └───────────────┬───────────────────────┘
+                    │  all paths → _build_error_response()
+                    ▼
+           Response(error_envelope, status=...)
+                    │
+                    ▼  (ApiRenderer detects already-enveloped, passes through)
+           JSON sent to client  →  see Section 9 for the envelope shape
 ```
 
 ---
@@ -1165,23 +1392,28 @@ View / Serializer / Service raises an exception
 
 ```
 Exception
-└── BaseAPIException          (base.py)
-    ├── ValidationException   400 VALIDATION_ERROR
-    ├── BusinessException     400 BUSINESS_RULE_VIOLATION
-    ├── AuthenticationException  401 AUTHENTICATION_ERROR
-    ├── PermissionException   403 PERMISSION_DENIED
-    ├── NotFoundException     404 NOT_FOUND
-    ├── ConflictException     409 CONFLICT
-    └── ServiceUnavailableException  503 SERVICE_UNAVAILABLE
+└── BaseAPIException               (base.py)
+    ├── ValidationException        400  VALIDATION_ERROR
+    ├── BusinessException          400  BUSINESS_RULE_VIOLATION
+    ├── AuthenticationException    401  AUTHENTICATION_ERROR
+    ├── PermissionException        403  PERMISSION_DENIED
+    ├── NotFoundException          404  NOT_FOUND
+    ├── ConflictException          409  CONFLICT
+    └── ServiceUnavailableException  503  SERVICE_UNAVAILABLE
 ```
 
-Every class has a `default_status_code` and `default_error_code`. Services can
-override both per-instance:
+Each class has `default_status_code` and `default_error_code`. Override either
+per-instance — or both:
 
 ```python
 raise BusinessException(
     message="Only draft orders can be submitted.",
-    error_code=ErrorCode.INVALID_STATE_TRANSITION,   # override the default
+    error_code=ErrorCode.INVALID_STATE_TRANSITION,  # override default
+)
+
+raise AuthenticationException(
+    message="Your session has expired. Please log in again.",
+    error_code=ErrorCode.TOKEN_EXPIRED,
 )
 ```
 
@@ -1189,7 +1421,8 @@ raise BusinessException(
 
 ### Error Codes
 
-`ErrorCode` is a `TextChoices` enum in `codes.py`. Use constants — never strings.
+`ErrorCode` is a `TextChoices` enum in `codes.py`. **Always use the constant —
+never a raw string.** The frontend contracts on these values.
 
 ```python
 from common.exceptions import ErrorCode
@@ -1206,7 +1439,7 @@ ErrorCode.TOKEN_EXPIRED             # "TOKEN_EXPIRED"
 # Resource State
 ErrorCode.NOT_FOUND                 # "NOT_FOUND"
 ErrorCode.CONFLICT                  # "CONFLICT"
-ErrorCode.GONE                      # "GONE"
+ErrorCode.GONE                      # "GONE"  (permanently deleted)
 
 # Domain / Business Logic
 ErrorCode.INVALID_STATE_TRANSITION  # "INVALID_STATE_TRANSITION"
@@ -1220,37 +1453,17 @@ ErrorCode.SYSTEM_ERROR              # "SYSTEM_ERROR"
 ErrorCode.SERVICE_UNAVAILABLE       # "SERVICE_UNAVAILABLE"
 ```
 
-**Adding app-specific codes:** Put them in `apps/<app>/exceptions/codes.py` using
-the same `TextChoices` pattern. Only add a new code when the **frontend needs to
-branch behaviour** based on it (e.g., show a retry button). If a message toast is
-enough, use a generic code with a descriptive `message`.
-
----
-
-### Settings
-
-```python
-# config/settings/base.py
-REST_FRAMEWORK = {
-    "DEFAULT_RENDERER_CLASSES": [
-        "common.response.renderers.ApiRenderer",
-    ],
-    "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
-    "DEFAULT_PAGINATION_CLASS": "common.response.pagination.ApiPageNumberPagination",
-    "PAGE_SIZE": 20,
-}
-```
-
 ---
 
 ### Usage in Services
 
-**Never** raise DRF exceptions in service functions. Raise domain exceptions —
-they're framework-agnostic and testable without a request context.
+**Never** import DRF exceptions in service-layer code. Raise domain exceptions —
+they are framework-agnostic and testable without a request context.
 
 ```python
 from common.exceptions import (
-    NotFoundException, BusinessException, ConflictException, ErrorCode
+    NotFoundException, BusinessException, ConflictException,
+    ServiceUnavailableException, ErrorCode
 )
 
 def get_user(user_id: str) -> User:
@@ -1258,7 +1471,6 @@ def get_user(user_id: str) -> User:
         return User.objects.get(id=user_id)
     except User.DoesNotExist:
         raise NotFoundException("User not found.")
-
 
 def submit_order(order_id: str, user) -> Order:
     order = Order.objects.filter(id=order_id, user=user).first()
@@ -1273,78 +1485,56 @@ def submit_order(order_id: str, user) -> Order:
     order.save()
     return order
 
-
 def create_user(email: str, **kwargs) -> User:
     if User.objects.filter(email=email).exists():
         raise ConflictException("A user with this email already exists.")
     return User.objects.create(email=email, **kwargs)
-```
 
----
-
-### Usage in Views
-
-Views return plain `Response(data)` — the renderer wraps everything automatically.
-Use `ApiResponse` only when you need a success `message` for a toast notification:
-
-```python
-from rest_framework import status, viewsets
-from rest_framework.response import Response
-from common.response import ApiResponse
-
-
-class UserViewSet(viewsets.ViewSet):
-
-    def list(self, request):
-        users = list_users()
-        serializer = UserSerializer(users, many=True)
-        return Response(serializer.data)                   # message=null, wrapped automatically
-
-    def create(self, request):
-        user = create_user(**request.data)
-        serializer = UserSerializer(user)
-        return ApiResponse(                                 # attach a toast message
-            serializer.data,
-            status=status.HTTP_201_CREATED,
-            message="User created successfully.",
+def charge_card(payment_method_id: str, amount: int) -> dict:
+    try:
+        return payment_gateway.charge(payment_method_id, amount)
+    except payment_gateway.Timeout:
+        raise ServiceUnavailableException(
+            "Payment service is temporarily unavailable. Please try again."
         )
-
-    def destroy(self, request, pk=None):
-        delete_user(pk)
-        return Response(status=status.HTTP_204_NO_CONTENT) # empty body, no envelope
 ```
 
 ---
 
 ### Validation Errors — Nested Serializers
 
-`handler.py` flattens nested DRF validation errors into a flat `details[]` list
-using dot-notation. The frontend always gets the same shape regardless of how
-deeply nested the serializer is:
+`handler.py` recursively flattens DRF validation errors into a flat `details[]`
+list using **dot-notation** for nested serializers and **index-notation** for list
+serializers. The frontend always receives the same shape regardless of nesting depth.
 
 ```python
-# Serializer with nested profile
+# Serializer with a nested profile
 class UserSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    profile = ProfileSerializer()
+    email   = serializers.EmailField()
+    profile = ProfileSerializer()   # nested
 
-# If email + profile.phone both fail:
+# When email + profile.phone both fail:
 {
   "errors": {
     "code": "VALIDATION_ERROR",
     "details": [
-      {"type": "field", "field": "email",         "code": "REQUIRED", "message": "..."},
-      {"type": "field", "field": "profile.phone", "code": "INVALID",  "message": "..."}
+      {"type": "field", "field": "email",         "code": "REQUIRED", "message": "This field is required."},
+      {"type": "field", "field": "profile.phone", "code": "INVALID",  "message": "Enter a valid phone number."}
     ]
   }
 }
+
+# List serializer — uses index prefix:
+{"type": "field", "field": "items.0.quantity", "code": "MIN_VALUE", "message": "..."}
 ```
 
 ---
 
 ### App-Specific Error Codes
 
-Add domain codes only when the frontend needs to take a different action:
+Put app-level codes in `apps/<app>/exceptions/codes.py`. Follow the same
+`TextChoices` pattern. **Add a new code only when the frontend must take a
+distinctly different UI action** — not just show a different message.
 
 ```python
 # apps/orders/exceptions/codes.py
@@ -1360,12 +1550,13 @@ class OrderErrorCode(models.TextChoices):
 from common.exceptions import BusinessException
 from apps.orders.exceptions.codes import OrderErrorCode
 
-def submit_order(order_id: str, user) -> Order:
-    ...
-    raise BusinessException(
-        message="This order has already been submitted.",
-        error_code=OrderErrorCode.ORDER_ALREADY_SUBMITTED,
-    )
+def resubmit_order(order_id: str) -> Order:
+    order = get_order_or_404(order_id)
+    if order.status == "SUBMITTED":
+        raise BusinessException(
+            message="This order has already been submitted.",
+            error_code=OrderErrorCode.ORDER_ALREADY_SUBMITTED,
+        )
 ```
 
 ---
@@ -1375,48 +1566,49 @@ def submit_order(order_id: str, user) -> Order:
 **1. Always raise typed domain exceptions from services — never DRF exceptions**
 
 ```python
-# Good — domain exception, no DRF import needed in services
+# Good — domain exception, framework-agnostic
 raise NotFoundException("Order not found.")
 
-# Bad — DRF exception couples services to the HTTP layer
+# Bad — couples service layer to HTTP/DRF
 from rest_framework.exceptions import NotFound
 raise NotFound("Order not found.")
 ```
 
-**2. Never return error dicts from services**
+**2. Never return error signals from service functions**
 
 ```python
-# Good
+# Good — explicit, impossible to ignore
 raise BusinessException("Insufficient stock.")
 
-# Bad — callers must check return value; errors silently get ignored
+# Bad — caller must check; errors silently get swallowed
+return None
 return {"error": "Insufficient stock."}
 ```
 
-**3. Use the right exception class**
+**3. Use the right exception class for the situation**
 
 | Situation | Exception |
 |-----------|-----------|
 | Resource not found | `NotFoundException` |
 | Duplicate / already exists | `ConflictException` |
-| FSM violation (wrong state) | `BusinessException(error_code=INVALID_STATE_TRANSITION)` |
+| FSM / wrong state | `BusinessException(error_code=INVALID_STATE_TRANSITION)` |
 | Domain rule violated | `BusinessException` |
-| Bad input (field-level) | Let serializer raise `DRFValidationError` |
-| Invalid credentials | `AuthenticationException` |
-| Lacks permission | `PermissionException` |
+| Field-level input error | Let DRF serializer raise `ValidationError` |
+| Bad credentials | `AuthenticationException` |
+| Valid user, wrong permission | `PermissionException` |
 | External service down | `ServiceUnavailableException` |
 
-**4. Keep error messages human-readable, error codes machine-readable**
+**4. Keep messages human-readable; keep codes machine-readable**
 
 ```python
-# Good — message for humans, code for frontend logic
+# Good
 raise BusinessException(
-    message="Your account has been suspended. Contact support.",
+    message="Your account has been suspended. Please contact support.",
     error_code=ErrorCode.PERMISSION_DENIED,
 )
 
-# Bad — technical jargon in message
-raise BusinessException(message="PERMISSION_DENIED_ACCOUNT_SUSPENDED")
+# Bad — technical jargon in user-visible message
+raise BusinessException(message="ACCOUNT_SUSPENDED_PERMISSION_DENIED")
 ```
 
 **5. Use `details` for field-level context on domain exceptions**
@@ -1426,38 +1618,361 @@ raise ValidationException(
     message="Profile validation failed.",
     details=[
         {"type": "field", "field": "phone", "code": "INVALID_FORMAT",
-         "message": "Phone must be in E.164 format."},
+         "message": "Phone must be in E.164 format (+12345678901)."},
     ],
 )
 ```
 
-**6. The 500 response in production hides internals — trust it**
+**6. The production 500 hides internals — trust it**
 
-`_handle_unhandled_exception()` logs the full traceback server-side but returns
-a generic `"Something went wrong"` to clients in production. Never catch-all and
-re-raise just to include exception details in the response — it leaks internals.
+`_handle_unhandled_exception()` always logs the full traceback server-side.
+In production it returns `"Something went wrong"` — intentionally vague. Never
+catch-all and re-raise with exception details in the response; that leaks
+implementation internals to clients.
 
-**7. `ServiceUnavailableException` for retryable failures**
+**7. `ServiceUnavailableException` signals a retryable failure**
 
-```python
-try:
-    result = external_payment_api.charge(...)
-except requests.Timeout:
-    raise ServiceUnavailableException(
-        "Payment service is temporarily unavailable. Please try again."
-    )
-```
+Use it for any downstream dependency failure (external API, queue, cache). The
+`503` status code tells load balancers and clients the operation can be retried.
 
-**8. Don't add app-specific error codes for every failure — keep the set tight**
+**8. Keep the global `ErrorCode` set tight**
 
 A generic `BUSINESS_RULE_VIOLATION` with a descriptive `message` is almost always
-enough. Only add a dedicated code when the frontend must branch its UI (e.g.,
-show a "Resubmit documents" button vs a generic retry). Every new code becomes
-a contract with consumers — be conservative.
+sufficient. Only introduce a dedicated code when the frontend must branch its UI
+(e.g., show a "Resubmit documents" button instead of a generic error toast). Every
+new code is a contract with consumers — be conservative.
 
 ---
 
-## 9. Structured Logging
+## 10. Consistent Response Contract
+
+Every API response from this project — success, error, paginated, or empty — uses
+the **same five-field JSON envelope**. Views never construct this envelope manually;
+the `ApiRenderer` wraps responses automatically, and the exception handler fills in
+the error shape. All of this lives in `common/response/`.
+
+### Package Structure
+
+```
+common/response/
+├── __init__.py     # Re-exports: ApiResponse, ApiRenderer, ApiPageNumberPagination
+├── api_response.py # ApiResponse — DRF Response subclass with optional success message
+├── pagination.py   # ApiPageNumberPagination — ?page / ?page_size pagination
+└── renderers.py    # ApiRenderer — wraps ALL responses in the standard envelope
+```
+
+---
+
+### The Envelope — All Four Variants
+
+**1. Success — single object:**
+```json
+{
+  "success": true,
+  "message": "User created successfully.",
+  "data": { "id": "uuid", "email": "user@example.com" },
+  "meta": {},
+  "errors": null
+}
+```
+
+**2. Success — paginated list:**
+```json
+{
+  "success": true,
+  "message": null,
+  "data": [ { "id": "..." }, { "id": "..." } ],
+  "meta": {
+    "pagination": {
+      "page": 2,
+      "page_size": 20,
+      "total_pages": 5,
+      "total_records": 97,
+      "has_next": true,
+      "has_previous": true,
+      "next": "/api/v1/users/?page=3",
+      "previous": "/api/v1/users/?page=1"
+    }
+  },
+  "errors": null
+}
+```
+
+**3. Error (built by the exception handler):**
+```json
+{
+  "success": false,
+  "message": "Validation failed.",
+  "data": null,
+  "meta": {},
+  "errors": {
+    "code": "VALIDATION_ERROR",
+    "details": [
+      { "type": "field", "field": "email",         "code": "REQUIRED", "message": "This field is required." },
+      { "type": "field", "field": "profile.phone", "code": "INVALID",  "message": "Enter a valid phone number." }
+    ]
+  }
+}
+```
+
+**4. Empty — 204 No Content:**
+```
+(empty body — no envelope, no JSON)
+```
+
+**Invariants:**
+- `success` always agrees with HTTP status: `true` = 2xx, `false` = 4xx/5xx.
+- `data` is `null` on errors; `errors` is `null` on success.
+- `meta` is always present (empty object `{}` when nothing extra to convey).
+- `message` carries a human-readable string for toast notifications, or `null`.
+
+---
+
+### How ApiRenderer Works
+
+`ApiRenderer` extends DRF's `JSONRenderer` and intercepts **every** response
+before it leaves the server. It runs four detection checks in order:
+
+```
+ApiRenderer.render(data, ...)
+        │
+        ├─ status == 204?              → return b""          (empty body)
+        │
+        ├─ data has "success"+"errors"?→ pass through        (already enveloped by handler)
+        │
+        ├─ status >= 400?              → error fallback       (bypassed handler edge-case)
+        │
+        ├─ data has "results"+"count"? → paginated envelope   (restructure into meta.pagination)
+        │
+        └─ else                        → success envelope     (wrap in success shape)
+```
+
+Because the renderer handles all wrapping, **views never construct the envelope**.
+`Response(serializer.data)` is all a view needs to write.
+
+---
+
+### ApiResponse — Success Messages
+
+`ApiResponse` is a thin `Response` subclass that lets views attach an optional
+success message. The renderer reads `response.api_message` and places it in the
+envelope's `message` field.
+
+```python
+from common.response import ApiResponse
+
+# With message — renderer sets message field in envelope
+return ApiResponse(
+    serializer.data,
+    status=status.HTTP_201_CREATED,
+    message="Order submitted successfully.",
+)
+
+# Without message — renderer sets message=null (fine for GET, DELETE, etc.)
+return Response(serializer.data)
+```
+
+Use `ApiResponse` only on mutating endpoints where the UI should show a
+confirmation toast. For read endpoints, `message=null` is perfectly correct.
+
+---
+
+### Pagination
+
+`ApiPageNumberPagination` is wired as the global default. Every `list` endpoint
+automatically paginates; no per-view configuration needed.
+
+**Query parameters:**
+
+| Parameter | Default | Maximum | Description |
+|-----------|---------|---------|-------------|
+| `page` | `1` | — | 1-based page number |
+| `page_size` | `20` | `100` | Records per page |
+
+**Example request:**
+```
+GET /api/v1/users/?page=2&page_size=50
+```
+
+**Pagination meta fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `page` | int | Current page (from request) |
+| `page_size` | int | Records returned on this page |
+| `total_pages` | int | Ceiling of total_records ÷ page_size |
+| `total_records` | int | Total matching records |
+| `has_next` | bool | Whether a next page exists |
+| `has_previous` | bool | Whether a previous page exists |
+| `next` | str\|null | Full URL of next page |
+| `previous` | str\|null | Full URL of previous page |
+
+DRF's pagination classes produce `{"count", "next", "previous", "results"}` internally.
+`ApiRenderer` detects this shape and restructures it into `meta.pagination`. The
+DRF internals never reach the client.
+
+---
+
+### Usage in Views
+
+Three patterns — pick the right one for each endpoint:
+
+```python
+from rest_framework import status, viewsets
+from rest_framework.response import Response
+from common.response import ApiResponse
+
+
+class OrderViewSet(viewsets.ModelViewSet):
+
+    # Pattern 1: Plain Response — renderer wraps with message=null
+    def list(self, request):
+        orders = get_orders_for_user(request.user)
+        serializer = OrderSerializer(orders, many=True)
+        return Response(serializer.data)
+
+    # Pattern 2: ApiResponse — attach a success message (for toast notifications)
+    def create(self, request):
+        order = create_order(request.user, **request.data)
+        serializer = OrderSerializer(order)
+        return ApiResponse(
+            serializer.data,
+            status=status.HTTP_201_CREATED,
+            message="Order placed successfully.",
+        )
+
+    # Pattern 3: 204 No Content — renderer returns empty body, no envelope
+    def destroy(self, request, pk=None):
+        cancel_order(pk, request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+```
+
+**Custom `@action` endpoints** follow the same patterns:
+
+```python
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        order = submit_order(pk, request.user)   # may raise BusinessException
+        serializer = OrderSerializer(order)
+        return ApiResponse(
+            serializer.data,
+            message="Order submitted. You'll receive a confirmation email shortly.",
+        )
+```
+
+---
+
+### Settings Reference
+
+All three response-contract settings live together in `REST_FRAMEWORK`:
+
+```python
+# config/settings/base.py
+REST_FRAMEWORK = {
+    # Wraps every response in {success, message, data, meta, errors}
+    "DEFAULT_RENDERER_CLASSES": [
+        "common.response.renderers.ApiRenderer",
+    ],
+    # Normalises all exceptions into the error envelope
+    "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
+    # ?page / ?page_size pagination (max 100 records per page)
+    "DEFAULT_PAGINATION_CLASS": "common.response.pagination.ApiPageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+```
+
+---
+
+### How Exception Errors Fit the Envelope
+
+When the exception handler (Section 8) fires, it calls `_build_error_response()`
+which constructs a `Response` with the error envelope already set. The renderer
+detects the `success + errors` keys and **passes the response through unchanged** —
+it does not double-wrap it.
+
+```
+Exception raised
+    → handler builds {success: false, ..., errors: {...}}
+    → Response(body, status=4xx/5xx)
+    → ApiRenderer detects "success" + "errors" keys
+    → passes through without modification
+    → client receives the exact envelope the handler built
+```
+
+This means the renderer and handler are decoupled: the handler does not call the
+renderer; the renderer does not know about exceptions. They cooperate only through
+the shared envelope contract.
+
+---
+
+### Best Practices
+
+**1. Never construct the envelope in views**
+
+```python
+# Good — renderer handles it
+return Response(serializer.data, status=201)
+
+# Bad — manual envelope bypasses the renderer's logic
+return Response({"success": True, "data": serializer.data}, status=201)
+```
+
+**2. Use `ApiResponse` only on mutating endpoints that warrant a toast**
+
+GET, HEAD, and OPTIONS responses rarely need a `message`. Reserve it for create,
+update, submit, and other actions where the user is waiting for confirmation.
+
+**3. Return 204, not `Response({})`**
+
+```python
+# Good — renderer returns empty body; client knows nothing was returned
+return Response(status=status.HTTP_204_NO_CONTENT)
+
+# Bad — wraps an empty dict, clients get {success: true, data: {}}
+return Response({})
+```
+
+**4. Never paginate inside a view — let the pagination class handle it**
+
+```python
+# Good — queryset returned; DRF paginates automatically
+def list(self, request):
+    qs = Order.objects.filter(user=request.user)
+    serializer = OrderSerializer(qs, many=True)
+    return Response(serializer.data)
+
+# Good — explicit pagination for ViewSets that override list()
+def list(self, request):
+    qs = Order.objects.filter(user=request.user)
+    page = self.paginate_queryset(qs)
+    serializer = OrderSerializer(page, many=True)
+    return self.get_paginated_response(serializer.data)
+
+# Bad — manual slicing breaks total_records and meta
+return Response(serializer.data[:20])
+```
+
+**5. Respect the `meta` field for future extensibility**
+
+`meta` is reserved for structural metadata (pagination, cursor tokens, rate-limit
+info). Do not overload it with business data — that belongs in `data`.
+
+**6. Do not add renderer-bypass hacks**
+
+The renderer checks `"success" in data and "errors" in data` to detect
+already-enveloped responses. If a view constructs a dict with those keys for any
+other reason, it will bypass wrapping silently. Keep the `success` / `errors` keys
+exclusively for the envelope contract.
+
+**7. Extend `meta` cleanly for cursor or keyset pagination**
+
+If you add a cursor pagination class later, have it return `{"cursor": "...",
+"results": [...], "count": N}` and add a cursor detection branch in `ApiRenderer`
+before the default pagination check. Never change the top-level envelope shape.
+
+---
+
+## 11. Structured Logging
 
 This project uses a **structured JSON logging** system built entirely on Python's
 standard `logging` module — no third-party libraries required. Every log entry is
@@ -2095,7 +2610,7 @@ For full audit logging of model field changes, use:
 
 ---
 
-## 10. Caching
+## 12. Caching
 
 ### Install Redis
 
@@ -2186,7 +2701,7 @@ class ProductsConfig(AppConfig):
 
 ---
 
-## 11. Async & Queues — Celery + Kafka
+## 13. Async & Queues — Celery + Kafka
 
 ### Celery Setup (standard async tasks)
 
@@ -2376,7 +2891,7 @@ KAFKA_BOOTSTRAP_SERVERS = env("KAFKA_BOOTSTRAP_SERVERS", default="localhost:9092
 
 ---
 
-## 12. Testing
+## 14. Testing
 
 ### Setup
 
@@ -2509,7 +3024,7 @@ pytest --cov=apps --cov-report=html # with coverage
 
 ---
 
-## 13. Security Checklist
+## 15. Security Checklist
 
 ```python
 # config/settings/production.py — ensure these are set
@@ -2545,7 +3060,7 @@ X_FRAME_OPTIONS = "DENY"
 
 ---
 
-## 14. Deployment Notes
+## 16. Deployment Notes
 
 ### Checklist
 
@@ -2586,7 +3101,7 @@ In production, use your platform's secret manager instead of `.env` files:
 
 ---
 
-## 15. Quick Reference — Commands Cheatsheet
+## 17. Quick Reference — Commands Cheatsheet
 
 ### Project & Apps
 

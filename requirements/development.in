@@ -1,0 +1,31 @@
+# =============================================================================
+# Development — local dev extras (inherits base)
+# =============================================================================
+# Compile: pip-compile requirements/development.in -o requirements/development.txt
+# Install: pip-sync requirements/development.txt
+# =============================================================================
+-r base.in
+
+# ---------------------------------------------------------------------------
+# Debugging
+# ---------------------------------------------------------------------------
+django-debug-toolbar>=4.4,<5.0         # SQL / request inspection panel (adds /__debug__/ URLs)
+ipython>=8.27,<9.0                      # Rich interactive shell (python manage.py shell)
+
+# ---------------------------------------------------------------------------
+# Code quality
+# ---------------------------------------------------------------------------
+ruff>=0.8,<1.0                          # Linter + formatter (replaces flake8 / isort / black)
+pre-commit>=4.0,<5.0                    # Git hook manager — runs ruff, mypy, etc. before commit
+
+# ---------------------------------------------------------------------------
+# Hot reload
+# ---------------------------------------------------------------------------
+watchfiles>=0.24,<1.0                   # Fast file watcher — replaces stat-poll in runserver
+
+# ---------------------------------------------------------------------------
+# Type checking (optional but recommended)
+# ---------------------------------------------------------------------------
+django-stubs>=5.1,<6.0                  # Django type stubs for mypy
+djangorestframework-stubs>=3.15,<4.0    # DRF type stubs
+mypy>=1.13,<2.0                         # Static type checker

@@ -1,0 +1,39 @@
+# =============================================================================
+# Test — CI and local test runner (inherits base)
+# =============================================================================
+# Compile: pip-compile requirements/test.in -o requirements/test.txt
+# Install: pip-sync requirements/test.txt
+# =============================================================================
+-r base.in
+
+# ---------------------------------------------------------------------------
+# Test framework
+# ---------------------------------------------------------------------------
+pytest>=8.3,<9.0                        # Test runner
+pytest-django>=4.9,<5.0                 # Django integration (settings, db, client fixtures)
+pytest-cov>=6.0,<7.0                    # Coverage plugin (wraps coverage.py)
+pytest-xdist>=3.5,<4.0                  # Parallel test execution (-n auto)
+
+# ---------------------------------------------------------------------------
+# Fixtures & fake data
+# ---------------------------------------------------------------------------
+factory-boy>=3.3,<4.0                   # Model factories (UserFactory, OrderFactory, etc.)
+faker>=30.0,<35.0                       # Realistic fake data generation
+
+# ---------------------------------------------------------------------------
+# API testing
+# ---------------------------------------------------------------------------
+httpx>=0.28,<1.0                        # Async HTTP client for API integration tests
+# pytest-drf — not included: requires DRF<4 and causes resolution depth failures on Python 3.14+
+#              Use DRF's built-in APIClient (rest_framework.test.APIClient) instead.
+
+# ---------------------------------------------------------------------------
+# Async & time control
+# ---------------------------------------------------------------------------
+pytest-asyncio>=0.24,<1.0              # Async view / Celery task test support
+freezegun>=1.5,<2.0                     # Freeze / travel time in tests (token expiry, scheduling)
+
+# ---------------------------------------------------------------------------
+# Quality gate (must match development.in version)
+# ---------------------------------------------------------------------------
+ruff>=0.8,<1.0                          # Linter in CI — same version as development
