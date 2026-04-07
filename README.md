@@ -1039,12 +1039,138 @@ X_FRAME_OPTIONS = "DENY"
 
 ---
 
-## 8. Exception Handling & Logging
+## 8. Exception Handling
+
+### DRF Custom Exception Handler
+
+Register a central handler in settings to normalise all errors into a consistent
+envelope. Every exception — DRF, Django, or unhandled — flows through one place.
+
+```python
+# config/settings/base.py
+REST_FRAMEWORK = {
+    "EXCEPTION_HANDLER": "common.exceptions.handler.api_exception_handler",
+}
+```
+
+```python
+# common/exceptions/handler.py
+import logging
+from rest_framework.views import exception_handler
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.exceptions import ValidationError as DjangoValidationError
+
+logger = logging.getLogger("common.exceptions.handler")
+
+
+def api_exception_handler(exc, context):
+    """Normalise all API errors into a consistent JSON envelope."""
+
+    # Convert Django ValidationError → DRF ValidationError
+    if isinstance(exc, DjangoValidationError):
+        from rest_framework.exceptions import ValidationError
+        exc = ValidationError(
+            detail=exc.message_dict if hasattr(exc, "message_dict") else exc.messages
+        )
+
+    response = exception_handler(exc, context)
+
+    if response is not None:
+        response.data = {
+            "success": False,
+            "message": _extract_message(response.data),
+            "errors": response.data,
+        }
+    else:
+        # Unhandled exception — log with full traceback, return generic 500
+        logger.exception("Unhandled exception", exc_info=exc)
+        response = Response(
+            {"success": False, "message": "An unexpected error occurred.", "errors": {}},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return response
+
+
+def _extract_message(data):
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if detail:
+            return str(detail)
+    return "Request failed."
+```
+
+### Raising Errors in Services
+
+Never construct error response dicts manually. Raise Python exceptions in services
+and let the central handler normalise them:
+
+```python
+from rest_framework.exceptions import ValidationError, PermissionDenied, NotFound
+
+def get_user(user_id: str, requesting_user) -> User:
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        raise NotFound("User not found.")
+
+    if user != requesting_user:
+        raise PermissionDenied("You cannot access another user's data.")
+
+    return user
+```
+
+### Custom Domain Exceptions
+
+For business-rule violations, define typed exceptions that carry an error code:
+
+```python
+# common/exceptions/base.py
+from rest_framework.exceptions import APIException
+from rest_framework import status
+
+
+class BusinessException(APIException):
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_code = "business_rule_violation"
+
+    def __init__(self, message: str, error_code: str = None):
+        self.detail = message
+        self.error_code = error_code
+        super().__init__(detail=message)
+
+
+class NotFoundException(APIException):
+    status_code = status.HTTP_404_NOT_FOUND
+    default_code = "not_found"
+```
+
+Usage in services:
+
+```python
+from common.exceptions.base import BusinessException
+
+def submit_order(order_id: str, user) -> Order:
+    order = get_object_or_404(Order, id=order_id, user=user)
+    if order.status != "DRAFT":
+        raise BusinessException(
+            "Only draft orders can be submitted.",
+            error_code="INVALID_STATE_TRANSITION",
+        )
+    ...
+```
+
+---
+
+## 9. Structured Logging
 
 This project uses a **structured JSON logging** system built entirely on Python's
-standard `logging` module — no third-party logging libraries required.
+standard `logging` module — no third-party libraries required. Every log entry is
+a JSON object containing stable, searchable fields: timestamps, request IDs, user
+context, event names, and sanitised payload metadata.
 
-### Architecture Overview
+### Package Structure
 
 ```
 common/logging/
@@ -1056,213 +1182,626 @@ common/logging/
 ├── middleware.py     # RequestLoggingMiddleware — access logs entry/exit point
 └── sanitizers.py     # PII masking: sanitize_body, sanitize_headers, etc.
 
+common/middleware.py  # AuditMiddleware — thread-local user for AuditModel
+
 logs/                 # Rotating log files (dev only; production uses stdout)
 ├── access.log        # HTTP request/response lifecycle
-├── app.log           # Application/domain business events
+├── app.log           # Application/domain business events + infra
 ├── security.log      # Auth, permissions, sensitive actions
 └── error.log         # Unhandled exceptions, integration failures
 ```
 
-### How It Works
+---
 
-1. **`RequestLoggingMiddleware`** intercepts every HTTP request:
-   - Extracts or generates `request_id` (from `X-Request-Id` header or UUID)
-   - Extracts or generates `correlation_id` (from `X-Correlation-Id` or request_id)
-   - Stores metadata in thread-local `RequestContext`
-   - Logs `http.request.received` on entry
-   - Logs `http.response.sent` on exit with duration and status code
-   - Sets `X-Request-Id` on the response header
-   - Clears `RequestContext` after response (critical for WSGI thread reuse)
+### Request Lifecycle — How Logging Flows
 
-2. **`RequestContextFilter`** enriches every `LogRecord` automatically:
-   - Reads from `RequestContext` and injects all fields into the record
-   - No manual context passing needed — `request_id`, `auth_user_id`, etc.
-     are always present in logs across the entire request lifecycle
+```
+HTTP Request arrives
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│  RequestLoggingMiddleware.__call__()                 │
+│                                                      │
+│  1. Extract X-Request-Id header (or generate UUID)  │
+│  2. Extract X-Correlation-Id header (or use req_id) │
+│  3. RequestContext.bind(request_id, method, path,   │
+│        client_ip, user_agent, ...)                  │
+│  4. _enrich_auth_context() → adds auth_user_id      │
+│  5. access_logger.info("http.request.received")     │
+└──────────────────┬──────────────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│  AuditMiddleware.__call__()                          │
+│                                                      │
+│  If DRF resolves auth in the view layer (after       │
+│  Django auth middleware), this catches it:           │
+│  - Sets thread_local.current_user_id (for AuditModel)│
+│  - RequestContext.update(auth_user_id, ...)          │
+└──────────────────┬──────────────────────────────────┘
+                   │
+                   ▼
+        View → Serializer → Service
+        (any logger.info/warning/error here automatically
+         includes request_id, auth_user_id, etc. because
+         RequestContextFilter injects them from thread-local)
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│  RequestLoggingMiddleware (response phase)           │
+│                                                      │
+│  6. access_logger.info/warning/error(               │
+│        "http.response.sent",                        │
+│        status_code, duration_ms, outcome)           │
+│  7. response["X-Request-Id"] = request_id           │
+│  8. RequestContext.clear()   ← CRITICAL for WSGI    │
+└─────────────────────────────────────────────────────┘
+                   │
+                   ▼
+         HTTP Response sent
 
-3. **`JsonFormatter`** serialises each record to a single-line JSON object with
-   stable fields: `timestamp`, `level`, `logger`, `service`, `environment`,
-   `version`, `hostname`, `pid`, `message`, plus all context fields.
-
-4. **`ConsoleFormatter`** renders human-readable coloured output in development.
-
-### Log Categories
-
-Each category maps to a named logger and a dedicated log file:
-
-| Logger name   | File            | Purpose                                    |
-|---------------|-----------------|--------------------------------------------|
-| `app.access`  | `access.log`    | HTTP request/response lifecycle            |
-| `app.app`     | `app.log`       | Application/domain business events        |
-| `app.security`| `security.log`  | Auth, permissions, sensitive actions       |
-| `app.error`   | `error.log`     | Unhandled exceptions, integration failures |
-| `app.infra`   | `app.log`       | Infrastructure/external integrations      |
-| `apps`        | `app.log`       | App-specific loggers (`logging.getLogger(__name__)`) |
-
-Use `LogCategory` constants instead of string literals:
-
-```python
-from common.logging import LogCategory
-
-logger = logging.getLogger(LogCategory.SECURITY)   # "app.security"
-logger = logging.getLogger(LogCategory.APP)        # "app.app"
+──────────────────────────────────────────────────────
+Every logger.*(msg, extra={...}) call in steps 3-6:
+  LogRecord created
+       │
+       ▼
+  RequestContextFilter.filter(record)
+  → reads RequestContext.as_dict()
+  → injects request_id, auth_user_id, method, path, ...
+  → into record.__dict__ (no manual passing needed)
+       │
+       ▼
+  JsonFormatter.format(record)
+  → merges base fields + injected context + extra={}
+  → outputs single-line JSON
+──────────────────────────────────────────────────────
 ```
 
-### Settings by Environment
+---
 
-**Development** (`config/settings/development.py`):
-- Console: human-readable coloured text
-- Files: all four log files written to `logs/`
-- SQL logging: opt-in via `LOG_SQL=True` env var
+### Configuration
 
-**Production** (`config/settings/production.py`):
-- Console: JSON formatter (for ELK/Datadog/CloudWatch collection)
-- Files: **removed** — stdout is the only log transport in containers
+#### `config/settings/base.py` — Core LOGGING dict
 
-**Test** (`config/settings/test.py`):
-- All handlers replaced with `NullHandler` — log output suppressed entirely
-- All loggers set to `CRITICAL` — keeps `pytest` output clean
+```python
+from common.logging.constants import LogCategory
 
-### Middleware Setup
+LOG_DIR = BASE_DIR / "logs"
 
-`RequestLoggingMiddleware` is registered in `config/settings/base.py` **after**
-`AuthenticationMiddleware` so `request.user` is available for auth context enrichment:
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+
+    "formatters": {
+        "json": {
+            "()": "common.logging.formatters.JsonFormatter",
+            "environment": APP_ENVIRONMENT,   # from env("DJANGO_ENV")
+            "version": APP_VERSION,           # from git SHA or env("APP_VERSION")
+        },
+        "console": {
+            "()": "common.logging.formatters.ConsoleFormatter",
+        },
+    },
+
+    "filters": {
+        "request_context": {
+            "()": "common.logging.filters.RequestContextFilter",
+        },
+    },
+
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "console",           # coloured text in dev
+            "filters": ["request_context"],
+            "stream": "ext://sys.stdout",
+        },
+        "file_access": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(LOG_DIR / "access.log"),
+            "formatter": "json",
+            "filters": ["request_context"],
+            "maxBytes": 10 * 1024 * 1024,     # 10 MB per file
+            "backupCount": 5,                  # 5 rotated backups kept
+            "encoding": "utf-8",
+        },
+        # file_app, file_security, file_error follow the same pattern
+    },
+
+    "loggers": {
+        LogCategory.ACCESS:   {"handlers": ["file_access", "console"], "level": "INFO",    "propagate": False},
+        LogCategory.APP:      {"handlers": ["file_app",    "console"], "level": "INFO",    "propagate": False},
+        LogCategory.SECURITY: {"handlers": ["file_security","console"], "level": "INFO",   "propagate": False},
+        LogCategory.ERROR:    {"handlers": ["file_error",  "console"], "level": "ERROR",   "propagate": False},
+        LogCategory.INFRA:    {"handlers": ["file_app",    "console"], "level": "INFO",    "propagate": False},
+        "apps":               {"handlers": ["file_app",    "console"], "level": "INFO",    "propagate": False},
+        "common.exceptions.handler": {"handlers": ["file_error", "console"], "level": "WARNING", "propagate": False},
+        "django.request":     {"handlers": ["file_error",  "console"], "level": "ERROR",   "propagate": False},
+        "django.security":    {"handlers": ["file_security","console"], "level": "WARNING","propagate": False},
+        "django.db.backends": {"handlers": ["file_app"],               "level": "WARNING", "propagate": False},
+    },
+
+    "root": {"handlers": ["console"], "level": "WARNING"},
+}
+```
+
+Logger keys use `LogCategory` constants — if you change the prefix in
+`constants.py`, the LOGGING dict updates automatically with no extra edits.
+
+#### `config/settings/development.py`
+
+```python
+import os
+os.makedirs(LOG_DIR, exist_ok=True)      # ensure logs/ directory exists
+
+if env.bool("LOG_SQL", default=False):   # opt-in SQL query logging
+    LOGGING["loggers"]["django.db.backends"]["level"] = "DEBUG"
+    LOGGING["loggers"]["django.db.backends"]["handlers"] = ["file_app", "console"]
+```
+
+#### `config/settings/production.py`
+
+```python
+# Switch console to JSON (machine-readable for ELK/Datadog/CloudWatch)
+LOGGING["handlers"]["console"]["formatter"] = "json"
+
+# Remove file handlers — container stdout is the single log transport
+_file_handlers = {"file_access", "file_app", "file_security", "file_error"}
+for handler_name in _file_handlers:
+    LOGGING["handlers"].pop(handler_name, None)
+
+for logger_config in LOGGING["loggers"].values():
+    logger_config["handlers"] = [
+        h for h in logger_config.get("handlers", []) if h not in _file_handlers
+    ] or ["console"]
+```
+
+#### `config/settings/test.py`
+
+```python
+# Suppress all output — keeps pytest output clean
+LOGGING["handlers"] = {"console": {"class": "logging.NullHandler"}}
+for logger_config in LOGGING["loggers"].values():
+    logger_config["handlers"] = ["console"]
+    logger_config["level"] = "CRITICAL"
+LOGGING["root"]["level"] = "CRITICAL"
+```
+
+---
+
+### Middleware Order
+
+Both logging middlewares must be placed after `AuthenticationMiddleware`:
 
 ```python
 MIDDLEWARE = [
-    ...
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    ...
-    'common.logging.middleware.RequestLoggingMiddleware',  # ← after auth
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',   # ← Django auth
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'common.logging.middleware.RequestLoggingMiddleware',        # ← access logs + context
+    'common.middleware.AuditMiddleware',                         # ← created_by/updated_by
 ]
 ```
 
-### Usage in Services
+**Why this order matters:**
+- `RequestLoggingMiddleware` calls `request.user` to enrich the log context — it needs `AuthenticationMiddleware` to have run first.
+- `AuditMiddleware` sets `thread_local.current_user_id` used by `AuditModel.save()` — it needs `RequestLoggingMiddleware` to have already bound the `RequestContext`.
+
+---
+
+### Log Categories — When to Use Which
+
+| Logger constant      | String value    | Use for                                             |
+|----------------------|-----------------|-----------------------------------------------------|
+| `LogCategory.ACCESS` | `app.access`    | HTTP lifecycle only (handled by middleware)         |
+| `LogCategory.APP`    | `app.app`       | Business domain events — orders created, submitted |
+| `LogCategory.SECURITY` | `app.security`| Auth events, permission checks, sensitive actions   |
+| `LogCategory.ERROR`  | `app.error`     | Integration failures, unhandled exceptions          |
+| `LogCategory.INFRA`  | `app.infra`     | External API calls, cache hits/misses, slow queries |
+| `"apps"` (or `__name__`) | varies    | General app logging; routes to `app.log`           |
+
+`LogCategory.ACCESS` is used exclusively by `RequestLoggingMiddleware` — don't
+use it in services.
+
+---
+
+### How to Use in Your App
+
+#### The standard pattern — services
 
 ```python
 import logging
 from common.logging import Events
 
-logger = logging.getLogger(__name__)  # routes to "apps" logger → app.log
+logger = logging.getLogger(__name__)          # → routes to "apps" → app.log
 
-def create_user(data: dict) -> User:
-    user = User.objects.create(**data)
+def create_order(user, data: dict) -> Order:
+    order = Order.objects.create(user=user, **data)
+
     logger.info(
-        "User created",
+        "Order created",
         extra={
-            "event": Events.USER_CREATED,
-            "entity_type": "user",
-            "entity_id": str(user.id),
+            "event": Events.USER_CREATED,         # stable event name
+            "entity_type": "order",               # what kind of thing
+            "entity_id": str(order.id),           # its ID
         },
     )
-    return user
+    return order
 ```
 
-Use `extra={}` to attach structured fields — they appear as top-level keys in
-the JSON output and are searchable in log aggregators.
+#### Security events
+
+```python
+import logging
+from common.logging import LogCategory, Events
+
+security_logger = logging.getLogger(LogCategory.SECURITY)
+
+def change_password(user, old_password, new_password):
+    if not user.check_password(old_password):
+        security_logger.warning(
+            "Password change failed — wrong current password",
+            extra={
+                "event": Events.AUTH_FAILED,
+                "entity_type": "user",
+                "entity_id": str(user.id),
+            },
+        )
+        raise ValidationError("Current password is incorrect.")
+
+    user.set_password(new_password)
+    user.save()
+
+    security_logger.info(
+        "Password changed successfully",
+        extra={
+            "event": Events.SENSITIVE_ACTION,
+            "entity_type": "user",
+            "entity_id": str(user.id),
+            "action": "password_change",
+        },
+    )
+```
+
+#### Infrastructure / external calls
+
+```python
+import logging
+from common.logging import LogCategory, Events
+
+infra_logger = logging.getLogger(LogCategory.INFRA)
+
+def send_email(to: str, subject: str, body: str):
+    infra_logger.info(
+        "Sending email",
+        extra={"event": Events.EXTERNAL_REQUEST_SENT, "provider": "smtp", "recipient_domain": to.split("@")[-1]},
+    )
+    try:
+        _smtp_send(to, subject, body)
+    except TimeoutError:
+        infra_logger.error(
+            "Email send timed out",
+            extra={"event": Events.EXTERNAL_TIMEOUT, "provider": "smtp"},
+        )
+        raise
+```
+
+#### Logging exceptions
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    result = call_payment_api(payload)
+except Exception as exc:
+    logger.exception(            # logs at ERROR + attaches full traceback
+        "Payment API call failed",
+        extra={"event": "error.integration", "provider": "stripe"},
+    )
+    raise
+```
+
+`logger.exception()` is equivalent to `logger.error(..., exc_info=True)` — always
+use it inside `except` blocks so the traceback is captured.
+
+#### Adding context from services (domain enrichment)
+
+```python
+from common.logging import RequestContext
+
+def process_payment(order_id: str):
+    # Adds order_id to ALL subsequent log entries in this request
+    RequestContext.update(order_id=order_id)
+    ...
+```
+
+#### Celery tasks (carry correlation IDs from HTTP)
+
+```python
+from common.logging import RequestContext
+
+@app.task
+def send_confirmation_email(order_id: str, correlation_id: str = None):
+    RequestContext.bind(
+        request_id=send_confirmation_email.request.id,
+        correlation_id=correlation_id,   # pass from the HTTP request that triggered the task
+    )
+    ...
+    RequestContext.clear()
+```
+
+#### Management commands
+
+```python
+import logging
+from common.logging import RequestContext
+
+logger = logging.getLogger(__name__)
+
+class Command(BaseCommand):
+    def handle(self, *args, **options):
+        RequestContext.bind(request_id="cmd-seed-users")   # optional but useful
+        logger.info("Seeding users started")
+        ...
+        RequestContext.clear()
+```
+
+---
 
 ### Event Taxonomy
 
-Use `Events` constants instead of free-text strings. This ensures consistent,
-searchable event names across the codebase:
+Always use `Events` constants — never invent free-text event strings. This keeps
+event names stable, consistent, and searchable in log aggregators.
 
 ```python
 from common.logging import Events
 
-# HTTP
-Events.HTTP_REQUEST_RECEIVED   # "http.request.received"
-Events.HTTP_RESPONSE_SENT      # "http.response.sent"
+# HTTP lifecycle (used by middleware only)
+Events.HTTP_REQUEST_RECEIVED        # "http.request.received"
+Events.HTTP_RESPONSE_SENT           # "http.response.sent"
 
 # Domain
-Events.USER_CREATED            # "domain.user.created"
-Events.USER_UPDATED            # "domain.user.updated"
+Events.USER_CREATED                 # "domain.user.created"
+Events.USER_UPDATED                 # "domain.user.updated"
+Events.USER_DEACTIVATED             # "domain.user.deactivated"
 
 # Security
-Events.AUTH_SUCCEEDED          # "security.auth.succeeded"
-Events.AUTH_FAILED             # "security.auth.failed"
-Events.PERMISSION_DENIED       # "security.permission.denied"
+Events.AUTH_SUCCEEDED               # "security.auth.succeeded"
+Events.AUTH_FAILED                  # "security.auth.failed"
+Events.PERMISSION_DENIED            # "security.permission.denied"
+Events.SENSITIVE_ACTION             # "security.sensitive_action.performed"
+Events.RATE_LIMIT_HIT               # "security.rate_limit.hit"
+Events.TOKEN_EXPIRED                # "security.token.expired"
 
 # Error
-Events.ERROR_UNHANDLED         # "error.unhandled"
-Events.ERROR_VALIDATION        # "error.validation"
+Events.ERROR_UNHANDLED              # "error.unhandled"
+Events.ERROR_VALIDATION             # "error.validation"
+Events.ERROR_BUSINESS_RULE          # "error.business_rule"
+Events.ERROR_DATABASE               # "error.database"
+Events.ERROR_INTEGRATION            # "error.integration"
 
 # Infrastructure
-Events.EXTERNAL_REQUEST_SENT   # "infra.external.request.sent"
-Events.DB_SLOW_QUERY           # "infra.db.slow_query"
+Events.EXTERNAL_REQUEST_SENT        # "infra.external.request.sent"
+Events.EXTERNAL_RESPONSE_RECEIVED   # "infra.external.response.received"
+Events.EXTERNAL_TIMEOUT             # "infra.external.timeout"
+Events.DB_SLOW_QUERY                # "infra.db.slow_query"
 ```
 
-Add new events to `common/logging/constants.py`. **Never rename existing ones** —
-only deprecate and add new. Downstream log queries and alerts depend on them.
+**Adding new events:** Add to `Events` in `common/logging/constants.py`.
+**Never rename or delete** existing event names — downstream alerts and log queries
+depend on them. Only add new names or leave old ones in place as deprecated.
+
+---
 
 ### PII Masking
 
-All request bodies, headers, and query params are automatically sanitised before
-logging. Masking strategies (defined in `constants.py`):
+All request bodies, headers, and query params logged by `RequestLoggingMiddleware`
+are automatically sanitised. The masking rules live in `constants.py`.
 
-| Strategy        | Fields                                      | Example output      |
-|-----------------|---------------------------------------------|---------------------|
-| Full mask `***` | `password`, `token`, `otp`, `api_key`, ...  | `"***"`             |
-| Partial mask    | `passport_number`, `iban`, `card_number`, … | `"***4321"`         |
-| Email mask      | `email`, `email_address`                    | `"m***@gmail.com"`  |
-| Phone mask      | `phone`, `mobile`, `phone_number`           | `"***1234"`         |
-| Redacted        | `biometric_data`, `file_content`, `dob`     | `"[REDACTED]"`      |
+| Strategy           | Example fields                                   | Output            |
+|--------------------|--------------------------------------------------|-------------------|
+| Full mask `***`    | `password`, `token`, `otp`, `api_key`, `secret`  | `"***"`           |
+| Partial `***XXXX`  | `passport_number`, `iban`, `card_number`, `ssn`  | `"***4321"`       |
+| Email `x***@d.com` | `email`, `email_address`, `contact_email`        | `"j***@gmail.com"`|
+| Phone `***XXXX`    | `phone`, `mobile`, `phone_number`                | `"***5678"`       |
+| `[REDACTED]`       | `biometric_data`, `file_content`, `dob`          | `"[REDACTED]"`    |
+| Header allowlist   | Only `content-type`, `user-agent`, `x-request-id`, etc. logged | others dropped |
 
-Use `sanitize_body()` explicitly when logging payloads that aren't automatically
-captured by middleware:
+Masking is applied recursively up to 5 levels deep in nested JSON.
+
+**Manually sanitise payloads** you log yourself (e.g. webhook bodies, async job
+payloads):
 
 ```python
-from common.logging import sanitize_body
+from common.logging import sanitize_body, sanitize_headers
 
-logger.info("Webhook received", extra={"payload": sanitize_body(raw_payload)})
+logger.info(
+    "Webhook received",
+    extra={"payload": sanitize_body(raw_webhook_data)},
+)
+
+logger.info(
+    "Outbound API call",
+    extra={"headers": sanitize_headers(request_headers)},
+)
 ```
 
-### Customising for Your Project
+**Adding fields to the masking registry:** Edit the relevant frozenset in
+`common/logging/constants.py`. Never add masking logic inline in services.
 
-When cloning this project as a base, update these values before production:
+---
 
-1. **`SERVICE_NAME`** in `common/logging/constants.py` — identifies your service
-   in centralised log aggregators (ELK, Datadog, CloudWatch).
+### Example Log Entries
 
-2. **`LogCategory` prefixes** in `common/logging/constants.py` — change `"app."`
-   to a project-specific prefix (e.g. `"myapp."`) to avoid collisions in shared
-   log indexes.
+**Development console (coloured text):**
 
-3. **`Events`** class in `common/logging/constants.py` — add domain-specific
-   event names for your application's business events.
+```
+[2026-04-07 10:23:01] INFO     app.access | http.request.received
+  POST /api/v1/users/
+  request_id=7d53de5e | method=POST | path=/api/v1/users/
 
-4. **`NO_BODY_LOG_PATHS`** in `common/logging/constants.py` — add paths for any
-   binary upload endpoints where bodies should never be logged.
+[2026-04-07 10:23:01] INFO     app.access | http.response.sent
+  POST /api/v1/users/ -> 201 (34.5ms)
+  request_id=7d53de5e | status_code=201 | duration_ms=34.5 | outcome=success
+```
 
-### Example JSON Log Entry
+**JSON (files in dev / stdout in production):**
 
 ```json
 {
   "timestamp": "2026-04-07T10:23:01.123456+00:00",
   "level": "INFO",
   "logger": "app.access",
-  "service": "django-unchained",
-  "environment": "development",
-  "version": "7221012",
-  "hostname": "my-machine.local",
+  "service": "my-project",
+  "environment": "production",
+  "version": "v1.4.2",
+  "hostname": "web-1.internal",
   "pid": 12345,
-  "message": "POST /api/v1/users/",
-  "event": "http.request.received",
+  "message": "POST /api/v1/users/ -> 201 (34.5ms)",
+  "event": "http.response.sent",
   "category": "access",
   "request_id": "7d53de5e-0f32-4dba-aa06-3919498f7165",
   "correlation_id": "7d53de5e-0f32-4dba-aa06-3919498f7165",
   "method": "POST",
   "path": "/api/v1/users/",
-  "client_ip": "127.0.0.1",
-  "auth_user_id": null
+  "status_code": 201,
+  "duration_ms": 34.5,
+  "outcome": "success",
+  "client_ip": "203.0.113.42",
+  "auth_user_id": "0196a3bc-1234-7890-abcd-ef0123456789"
 }
 ```
 
-For full audit logging (tracks field-level model changes), use:
+---
+
+### Best Practices
+
+**1. One logger per module, not one per class**
+
+```python
+# Good — standard Python convention
+logger = logging.getLogger(__name__)
+
+# Avoid — overly granular, no routing benefit
+logger = logging.getLogger("apps.orders.services.OrderService")
+```
+
+**2. Always use `extra={}` for structured data — never interpolate into the message**
+
+```python
+# Good — structured, searchable in ELK/Datadog
+logger.info("Order submitted", extra={"event": Events.USER_CREATED, "order_id": str(order.id)})
+
+# Bad — unstructured, hard to query
+logger.info(f"Order {order.id} submitted by user {user.id}")
+```
+
+**3. Choose the right level**
+
+| Level | Use for |
+|-------|---------|
+| `DEBUG` | Verbose tracing — local development only, never in production |
+| `INFO` | Normal business events — order created, user logged in |
+| `WARNING` | Expected failures — auth rejected, validation failed, retrying |
+| `ERROR` | Unexpected failures that need attention — integration timeout, 500 |
+| `CRITICAL` | System is partially down — leave this for alerts |
+
+**4. Use `logger.exception()` inside `except` blocks — never `logger.error()`**
+
+```python
+# Good — captures full traceback automatically
+try:
+    call_external_api()
+except Exception:
+    logger.exception("External API call failed")
+
+# Bad — loses the traceback
+except Exception as exc:
+    logger.error(f"External API call failed: {exc}")
+```
+
+**5. Use `Events` constants, never free-text event strings**
+
+Alerts, dashboards, and log queries depend on stable event names. Free-text breaks
+them silently. Add new constants to `Events` class — don't create one-off strings.
+
+**6. Never log raw request/response bodies — always sanitise first**
+
+Middleware does this automatically for HTTP requests. For everything else (Celery
+task args, webhook callbacks, external API responses), call `sanitize_body()` before
+putting data into `extra={}`.
+
+**7. `propagate: False` on all named loggers**
+
+Without it, records travel up to the root logger and get double-logged. All named
+loggers in the LOGGING config already set `"propagate": False`.
+
+**8. Don't log inside tight loops — aggregate instead**
+
+```python
+# Bad — thousands of log entries
+for item in large_queryset:
+    logger.info("Processing item", extra={"item_id": item.id})
+
+# Good — one summary entry
+logger.info("Batch processed", extra={"count": len(items), "duration_ms": elapsed})
+```
+
+**9. Use `RequestContext.update()` to enrich all logs for a domain operation**
+
+```python
+# After this call, ALL subsequent logger.* calls in this request will include order_id
+RequestContext.update(order_id=str(order.id))
+```
+
+This is far better than manually passing `order_id` in every `extra={}`.
+
+**10. `RequestContext.clear()` is called automatically — don't call it manually**
+
+`RequestLoggingMiddleware` handles cleanup after every response. Only call it
+manually in Celery tasks and management commands, where no middleware runs.
+
+---
+
+### Customising When Cloning
+
+| What to change | Where | How |
+|----------------|-------|-----|
+| Service name in logs | `.env` | `LOG_SERVICE_NAME=my-project` |
+| Logger prefix (`app.`) | `common/logging/constants.py` | Change `"app."` in `LogCategory` |
+| Domain event names | `common/logging/constants.py` | Add to `Events` class |
+| Binary upload paths (no body logging) | `common/logging/constants.py` | Add to `NO_BODY_LOG_PATHS` |
+| PII fields | `common/logging/constants.py` | Add to relevant masking frozenset |
+| Log rotation size/count | `config/settings/base.py` | `maxBytes`, `backupCount` in handlers |
+
+`SERVICE_NAME` is the only value that **does not require a code change** — set
+`LOG_SERVICE_NAME` in `.env` or your container environment and it's picked up
+automatically.
+
+---
+
+### `.env` variables for logging
+
+```bash
+LOG_SERVICE_NAME=my-project       # service name in JSON logs (default: django-unchained)
+LOG_SQL=True                      # enable SQL query logging in dev (default: False)
+APP_VERSION=v1.2.3                # version field in JSON logs (default: git SHA)
+DJANGO_ENV=development            # environment field in JSON logs
+```
+
+For full audit logging of model field changes, use:
 > **django-auditlog:** https://github.com/jazzband/django-auditlog
 > **django-simple-history:** https://github.com/jazzband/django-simple-history
 
 ---
 
-## 9. Caching
+## 10. Caching
 
 ### Install Redis
 
@@ -1353,7 +1892,7 @@ class ProductsConfig(AppConfig):
 
 ---
 
-## 10. Async & Queues — Celery + Kafka
+## 11. Async & Queues — Celery + Kafka
 
 ### Celery Setup (standard async tasks)
 
@@ -1543,7 +2082,7 @@ KAFKA_BOOTSTRAP_SERVERS = env("KAFKA_BOOTSTRAP_SERVERS", default="localhost:9092
 
 ---
 
-## 11. Testing
+## 12. Testing
 
 ### Setup
 
@@ -1676,7 +2215,7 @@ pytest --cov=apps --cov-report=html # with coverage
 
 ---
 
-## 12. Security Checklist
+## 13. Security Checklist
 
 ```python
 # config/settings/production.py — ensure these are set
@@ -1712,7 +2251,7 @@ X_FRAME_OPTIONS = "DENY"
 
 ---
 
-## 13. Deployment Notes
+## 14. Deployment Notes
 
 ### Checklist
 
@@ -1753,7 +2292,7 @@ In production, use your platform's secret manager instead of `.env` files:
 
 ---
 
-## 14. Quick Reference — Commands Cheatsheet
+## 15. Quick Reference — Commands Cheatsheet
 
 ### Project & Apps
 
